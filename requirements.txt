@@ -1,0 +1,7 @@
+streamlit==1.38.0
+backtrader==1.9.78.123
+yfinance==0.2.43
+pandas==2.2.2
+matplotlib==3.9.2
+plotly==5.24.1
+
