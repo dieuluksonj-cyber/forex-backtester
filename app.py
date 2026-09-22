@@ -16,8 +16,8 @@ import datetime as dt
 import backtrader as bt
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-import yfinance as yf
 
 st.set_page_config(page_title="Backtester Forex", layout="wide")
 
@@ -42,30 +42,40 @@ class MyStrategy(bt.Strategy):
 '''
 
 FOREX_PAIRS = {
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "USDJPY=X",
-    "USD/CHF": "USDCHF=X",
-    "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "USDCAD=X",
-    "NZD/USD": "NZDUSD=X",
-    "Autre (saisir le ticker Yahoo Finance)": None,
+    "EUR/USD": "EUR/USD",
+    "GBP/USD": "GBP/USD",
+    "USD/JPY": "USD/JPY",
+    "USD/CHF": "USD/CHF",
+    "AUD/USD": "AUD/USD",
+    "USD/CAD": "USD/CAD",
+    "NZD/USD": "NZD/USD",
+    "XAU/USD (Or)": "XAU/USD",
+    "XAG/USD (Argent)": "XAG/USD",
+    "Autre (saisir le symbole Twelve Data)": None,
 }
+
+TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 
 # ---------------------------------------------------------------------
 # Sidebar — paramètres
 # ---------------------------------------------------------------------
 st.sidebar.header("Paramètres du backtest")
 
+api_key = st.sidebar.text_input(
+    "Clé API Twelve Data",
+    type="password",
+    help="Gratuite sur twelvedata.com — nécessaire pour récupérer les données.",
+)
+
 pair_label = st.sidebar.selectbox("Paire", list(FOREX_PAIRS.keys()))
 ticker = FOREX_PAIRS[pair_label]
 if ticker is None:
-    ticker = st.sidebar.text_input("Ticker Yahoo Finance", "EURUSD=X")
+    ticker = st.sidebar.text_input("Symbole Twelve Data (ex: EUR/USD)", "EUR/USD")
 
 interval = st.sidebar.selectbox(
     "Timeframe",
-    ["1d", "1h", "30m", "15m"],
-    help="Yahoo Finance limite l'historique intraday (1h/30m/15m) aux ~60 derniers jours.",
+    ["1day", "4h", "1h", "30min", "15min", "5min", "1min"],
+    help="Le tier gratuit Twelve Data limite le nombre de requêtes/jour et l'historique disponible sur les timeframes courts.",
 )
 
 col1, col2 = st.sidebar.columns(2)
@@ -116,23 +126,48 @@ def load_strategy_class(code: str):
     return namespace["MyStrategy"]
 
 
-def fetch_data(ticker: str, start: dt.date, end: dt.date, interval: str) -> pd.DataFrame:
-    df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
-    if df.empty:
+def fetch_data(symbol: str, start: dt.date, end: dt.date, interval: str, api_key: str) -> pd.DataFrame:
+    if not api_key:
+        raise ValueError("Renseigne ta clé API Twelve Data dans la barre latérale.")
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "outputsize": 5000,
+        "apikey": api_key,
+        "order": "ASC",
+        "timezone": "UTC",
+    }
+    resp = requests.get(TWELVEDATA_URL, params=params, timeout=30)
+    data = resp.json()
+
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise ValueError(f"Erreur API Twelve Data : {data.get('message', 'erreur inconnue')}")
+
+    values = data.get("values") if isinstance(data, dict) else None
+    if not values:
         raise ValueError(
-            "Aucune donnée reçue. Vérifie le ticker, la période, "
-            "ou réduis la plage pour les timeframes intraday."
+            "Aucune donnée reçue. Vérifie le symbole, la période, "
+            "ou ta clé API (limite de requêtes atteinte ?)."
         )
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.rename(columns=str.lower)
+
+    df = pd.DataFrame(values)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    # Le forex n'a pas de vrai volume échangé centralisé ; Twelve Data n'en fournit pas non plus.
+    df["volume"] = df.get("volume", 0)
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     return df[["open", "high", "low", "close", "volume"]]
 
 
 if run:
     try:
         with st.spinner("Récupération des données..."):
-            data = fetch_data(ticker, start_date, end_date, interval)
+            data = fetch_data(ticker, start_date, end_date, interval, api_key)
 
         with st.spinner("Chargement de la stratégie..."):
             StrategyClass = load_strategy_class(strategy_code)
