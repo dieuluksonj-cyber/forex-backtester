@@ -78,10 +78,34 @@ interval = st.sidebar.selectbox(
     help="Le tier gratuit Twelve Data limite le nombre de requêtes/jour et l'historique disponible sur les timeframes courts.",
 )
 
-col1, col2 = st.sidebar.columns(2)
-default_start = dt.date.today() - dt.timedelta(days=365)
-start_date = col1.date_input("Début", default_start)
-end_date = col2.date_input("Fin", dt.date.today())
+# Largeur de fenêtre sûre par timeframe : reste sous la limite de 5000 bougies
+# par requête de Twelve Data, avec une marge de sécurité.
+MAX_WINDOW_DAYS = {
+    "1min": 3,
+    "5min": 15,
+    "15min": 45,
+    "30min": 90,
+    "1h": 180,
+    "4h": 600,
+    "1day": 1825,
+}
+window_days = MAX_WINDOW_DAYS[interval]
+st.sidebar.info(f"⏱️ Pour ce timeframe, période testable : **{window_days} jours** par backtest (limite Twelve Data).")
+
+offset_weeks = st.sidebar.number_input(
+    "Reculer de combien de semaines par rapport à aujourd'hui ?",
+    min_value=0, value=0, step=1,
+    help="0 = période la plus récente possible. Augmente pour tester une fenêtre plus ancienne (même largeur de période, juste décalée dans le temps).",
+)
+
+today = dt.date.today()
+end_date = today - dt.timedelta(weeks=offset_weeks)
+start_date = end_date - dt.timedelta(days=window_days)
+
+st.sidebar.caption(
+    f"📅 Période testée : **{start_date:%d/%m/%Y}** → **{end_date:%d/%m/%Y}** "
+    f"({window_days} jours, largeur fixe pour ce timeframe)."
+)
 
 initial_cash = st.sidebar.number_input("Capital initial ($)", value=10000, step=1000)
 commission = st.sidebar.number_input(
