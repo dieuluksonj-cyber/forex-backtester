@@ -17,6 +17,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from sandbox import run_backtest_sandboxed
+
 st.set_page_config(page_title="Backtester Forex", layout="wide")
 
 FOREX_PAIRS = {
@@ -366,16 +368,53 @@ st.warning(
     "Utilise cet outil à des fins éducatives et teste toujours en démo avant le réel."
 )
 
-strategy_label = st.selectbox("Stratégie", list(STRATEGIES.keys()))
-strategy_info = STRATEGIES[strategy_label]
-st.info(strategy_info["description"])
+strategy_label = st.selectbox("Stratégie", list(STRATEGIES.keys()) + ["✏️ Mon propre code"])
 
-if interval != strategy_info["recommended_interval"]:
+custom_code = None
+if strategy_label == "✏️ Mon propre code":
     st.caption(
-        f"💡 Cette stratégie a été validée sur le timeframe "
-        f"**{strategy_info['recommended_interval']}** — tu utilises **{interval}**, "
-        f"les résultats peuvent différer de ce qui a été testé."
+        "Ton code tourne dans un environnement isolé (processus séparé, "
+        "imports bloqués, timeout strict) — voir l'encart ci-dessous pour le détail."
     )
+    with st.expander("ℹ️ Règles du bac à sable (pourquoi ton code peut être refusé)"):
+        st.markdown(
+            """
+- Ta classe doit s'appeler **`MyStrategy`** et hériter de `bt.Strategy`.
+- **Aucun `import`** n'est autorisé — `bt` (backtrader) est déjà fourni.
+- Pas d'accès aux attributs commençant par `_` (bloque les tentatives de contournement).
+- Fonctions interdites : `open`, `eval`, `exec`, `os`, `sys`, etc.
+- Le code est exécuté dans un **processus isolé avec un timeout strict** — une boucle infinie sera automatiquement interrompue.
+- Utilise les méthodes standard de Backtrader : `__init__`, `next`, `self.buy()`, `self.sell()`, `self.close()`.
+            """
+        )
+    custom_code = st.text_area(
+        "Colle ton code ici",
+        value=(
+            "class MyStrategy(bt.Strategy):\n"
+            "    params = dict(fast=10, slow=30)\n\n"
+            "    def __init__(self):\n"
+            "        fast_ma = bt.ind.SMA(period=self.p.fast)\n"
+            "        slow_ma = bt.ind.SMA(period=self.p.slow)\n"
+            "        self.crossover = bt.ind.CrossOver(fast_ma, slow_ma)\n\n"
+            "    def next(self):\n"
+            "        if not self.position:\n"
+            "            if self.crossover > 0:\n"
+            "                self.buy()\n"
+            "        elif self.crossover < 0:\n"
+            "            self.close()\n"
+        ),
+        height=280,
+    )
+else:
+    strategy_info = STRATEGIES[strategy_label]
+    st.info(strategy_info["description"])
+
+    if interval != strategy_info["recommended_interval"]:
+        st.caption(
+            f"💡 Cette stratégie a été validée sur le timeframe "
+            f"**{strategy_info['recommended_interval']}** — tu utilises **{interval}**, "
+            f"les résultats peuvent différer de ce qui a été testé."
+        )
 
 run = st.button("🚀 Lancer le backtest", type="primary")
 
@@ -441,26 +480,41 @@ if run:
             )
 
         with st.spinner("Backtest en cours..."):
-            StrategyClass = strategy_info["class"]
+            if strategy_label == "✏️ Mon propre code":
+                if not custom_code or not custom_code.strip():
+                    raise ValueError("Colle ton code de stratégie avant de lancer le backtest.")
+                result = run_backtest_sandboxed(custom_code, data, initial_cash, commission, size_pct)
+                start_value = result["start_value"]
+                end_value = result["end_value"]
+                trades = result["trades"]
+                dd = result["drawdown"]
+                sharpe = result["sharpe"]
+                time_return = result["time_return"]
+            else:
+                StrategyClass = strategy_info["class"]
 
-            cerebro = bt.Cerebro()
-            cerebro.addstrategy(StrategyClass)
-            feed = bt.feeds.PandasData(dataname=data, openinterest=-1)
-            cerebro.adddata(feed)
-            cerebro.broker.setcash(initial_cash)
-            cerebro.broker.setcommission(commission=commission / 100)
-            cerebro.addsizer(bt.sizers.PercentSizer, percents=size_pct)
+                cerebro = bt.Cerebro()
+                cerebro.addstrategy(StrategyClass)
+                feed = bt.feeds.PandasData(dataname=data, openinterest=-1)
+                cerebro.adddata(feed)
+                cerebro.broker.setcash(initial_cash)
+                cerebro.broker.setcommission(commission=commission / 100)
+                cerebro.addsizer(bt.sizers.PercentSizer, percents=size_pct)
 
-            cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
-            cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
-            cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe", timeframe=bt.TimeFrame.Days)
-            cerebro.addanalyzer(bt.analyzers.Returns, _name="returns")
-            cerebro.addanalyzer(bt.analyzers.TimeReturn, _name="time_return")
+                cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
+                cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
+                cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe", timeframe=bt.TimeFrame.Days)
+                cerebro.addanalyzer(bt.analyzers.TimeReturn, _name="time_return")
 
-            start_value = cerebro.broker.getvalue()
-            results = cerebro.run()
-            end_value = cerebro.broker.getvalue()
-            strat = results[0]
+                start_value = cerebro.broker.getvalue()
+                results = cerebro.run()
+                end_value = cerebro.broker.getvalue()
+                strat = results[0]
+
+                trades = to_plain(strat.analyzers.trades.get_analysis())
+                dd = to_plain(strat.analyzers.drawdown.get_analysis())
+                sharpe = strat.analyzers.sharpe.get_analysis().get("sharperatio")
+                time_return = dict(strat.analyzers.time_return.get_analysis())
 
         st.success("Backtest terminé ✅")
 
@@ -470,14 +524,9 @@ if run:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Valeur finale", f"${end_value:,.2f}", f"{pnl_pct:+.2f}%")
         m2.metric("P&L", f"${pnl:,.2f}")
-
-        dd = strat.analyzers.drawdown.get_analysis()
         m3.metric("Drawdown max", f"{dd.get('max', {}).get('drawdown', 0):.2f}%")
-
-        sharpe = strat.analyzers.sharpe.get_analysis().get("sharperatio")
         m4.metric("Sharpe ratio", f"{sharpe:.2f}" if sharpe else "N/A")
 
-        trades = strat.analyzers.trades.get_analysis()
         total_trades = trades.get("total", {}).get("total", 0)
         won = trades.get("won", {}).get("total", 0)
         win_rate = (won / total_trades * 100) if total_trades else 0
@@ -487,7 +536,6 @@ if run:
         t2.metric("Trades gagnants", won)
         t3.metric("Win rate", f"{win_rate:.1f}%")
 
-        time_return = strat.analyzers.time_return.get_analysis()
         if time_return:
             dates = list(time_return.keys())
             returns = list(time_return.values())
@@ -507,8 +555,8 @@ if run:
             st.plotly_chart(fig, use_container_width=True)
 
         with st.expander("Détails bruts des analyzers"):
-            st.write("Trades:", to_plain(trades))
-            st.write("Drawdown:", to_plain(dd))
+            st.write("Trades:", trades)
+            st.write("Drawdown:", dd)
 
     except Exception as e:
         st.error(f"Erreur pendant le backtest : {e}")
