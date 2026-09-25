@@ -1,16 +1,14 @@
 """
-Backtester Forex personnel — Streamlit + Backtrader
-----------------------------------------------------
-Colle ta stratégie (classe Backtrader) dans la zone de texte, choisis
-la paire et la période, puis lance le backtest. Les résultats (courbe
-d'équité, stats, trades) s'affichent directement dans l'app.
+Backtester Forex — Streamlit + Backtrader
+------------------------------------------
+Choisis une strategie predefinie, la paire et la periode, puis lance le
+backtest. Les resultats (courbe d'equite, stats, trades) s'affichent
+directement dans l'app.
 
 Lancer avec :
     streamlit run app.py
 """
 
-import io
-import contextlib
 import datetime as dt
 
 import backtrader as bt
@@ -20,26 +18,6 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Backtester Forex", layout="wide")
-
-# ---------------------------------------------------------------------
-# Stratégie d'exemple (utilisée si l'utilisateur ne colle pas la sienne)
-# ---------------------------------------------------------------------
-EXAMPLE_STRATEGY = '''\
-class MyStrategy(bt.Strategy):
-    params = dict(fast=10, slow=30)
-
-    def __init__(self):
-        fast_ma = bt.ind.SMA(period=self.p.fast)
-        slow_ma = bt.ind.SMA(period=self.p.slow)
-        self.crossover = bt.ind.CrossOver(fast_ma, slow_ma)
-
-    def next(self):
-        if not self.position:
-            if self.crossover > 0:
-                self.buy()
-        elif self.crossover < 0:
-            self.close()
-'''
 
 FOREX_PAIRS = {
     "EUR/USD": "EUR/USD",
@@ -56,15 +34,279 @@ FOREX_PAIRS = {
 
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 
+
+# ===========================================================================
+# STRATEGIES PREDEFINIES
+# (plus de code arbitraire colle par l'utilisateur : securite pour une app
+#  publique, ou n'importe qui pourrait sinon executer du code sur le serveur)
+# ===========================================================================
+
+class DonchianSwingStrategy(bt.Strategy):
+    """Breakout Donchian + tendance EMA200 + filtre ATR + SL/TP fixes + breakeven.
+    Pensee pour un timeframe 1h."""
+    params = dict(
+        ema_trend=200,
+        donchian_period=20,
+        atr_period=14,
+        atr_avg_period=50,
+        atr_mult=1.5,
+        min_sl_distance=3.00,
+        rr_ratio=1.5,
+        breakeven_trigger=0.5,
+        max_trades_per_day=5,
+    )
+
+    def __init__(self):
+        self.ema_trend = bt.ind.EMA(period=self.p.ema_trend)
+        self.atr = bt.ind.ATR(period=self.p.atr_period)
+        self.atr_avg = bt.ind.SMA(self.atr, period=self.p.atr_avg_period)
+        self.donchian_high = bt.ind.Highest(self.data.high(-1), period=self.p.donchian_period)
+        self.donchian_low = bt.ind.Lowest(self.data.low(-1), period=self.p.donchian_period)
+
+        self.trades_today = 0
+        self.current_day = None
+        self.entry_price = None
+        self.sl = None
+        self.tp = None
+        self.sl_distance = None
+        self.breakeven_armed = False
+        self.trade_type = None
+
+    def next(self):
+        bar_date = self.data.datetime.date(0)
+        if self.current_day != bar_date:
+            self.current_day = bar_date
+            self.trades_today = 0
+
+        min_bars = max(self.p.ema_trend, self.p.donchian_period, self.p.atr_avg_period) + 5
+        if len(self) < min_bars:
+            return
+
+        price = self.data.close[0]
+
+        if self.position:
+            if self.trade_type == "BUY":
+                if not self.breakeven_armed and price >= self.entry_price + self.sl_distance * self.p.breakeven_trigger:
+                    self.breakeven_armed = True
+                    self.sl = self.entry_price
+                if price >= self.tp:
+                    self.close()
+                elif self.data.low[0] <= self.sl:
+                    self.close()
+            elif self.trade_type == "SELL":
+                if not self.breakeven_armed and price <= self.entry_price - self.sl_distance * self.p.breakeven_trigger:
+                    self.breakeven_armed = True
+                    self.sl = self.entry_price
+                if price <= self.tp:
+                    self.close()
+                elif self.data.high[0] >= self.sl:
+                    self.close()
+            return
+
+        if self.trades_today >= self.p.max_trades_per_day:
+            return
+        if self.atr[0] < self.atr_avg[0]:
+            return
+
+        trend_bullish = price > self.ema_trend[0]
+        trend_bearish = price < self.ema_trend[0]
+        breakout_up = price > self.donchian_high[0]
+        breakout_down = price < self.donchian_low[0]
+
+        sl_distance = max(self.atr[0] * self.p.atr_mult, self.p.min_sl_distance)
+
+        if trend_bullish and breakout_up:
+            self.entry_price = price
+            self.sl_distance = sl_distance
+            self.sl = price - sl_distance
+            self.tp = price + sl_distance * self.p.rr_ratio
+            self.breakeven_armed = False
+            self.trade_type = "BUY"
+            self.buy()
+            self.trades_today += 1
+        elif trend_bearish and breakout_down:
+            self.entry_price = price
+            self.sl_distance = sl_distance
+            self.sl = price + sl_distance
+            self.tp = price - sl_distance * self.p.rr_ratio
+            self.breakeven_armed = False
+            self.trade_type = "SELL"
+            self.sell()
+            self.trades_today += 1
+
+
+class ScalpingMomentumStrategy(bt.Strategy):
+    """Breakout Donchian court + EMA50 + momentum RSI + cooldown apres perte.
+    Pensee pour un timeframe 5min."""
+    params = dict(
+        ema_trend=50,
+        donchian_period=10,
+        rsi_period=9,
+        atr_period=14,
+        atr_avg_period=30,
+        sl_atr_mult=1.0,
+        rr_ratio=1.3,
+        min_sl_distance=1.5,
+        breakeven_trigger=0.5,
+        max_trades_per_day=20,
+        cooldown_bars=6,
+    )
+
+    def __init__(self):
+        self.ema_trend = bt.ind.EMA(period=self.p.ema_trend)
+        self.rsi = bt.ind.RSI(period=self.p.rsi_period, safediv=True)
+        self.atr = bt.ind.ATR(period=self.p.atr_period)
+        self.atr_avg = bt.ind.SMA(self.atr, period=self.p.atr_avg_period)
+        self.donchian_high = bt.ind.Highest(self.data.high(-1), period=self.p.donchian_period)
+        self.donchian_low = bt.ind.Lowest(self.data.low(-1), period=self.p.donchian_period)
+
+        self.trades_today = 0
+        self.current_day = None
+        self.bars_since_loss = 999
+        self.entry_price = None
+        self.sl = None
+        self.tp = None
+        self.sl_distance = None
+        self.breakeven_armed = False
+        self.trade_type = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            if trade.pnl < 0:
+                self.bars_since_loss = 0
+            self.entry_price = None
+            self.sl = None
+            self.tp = None
+            self.trade_type = None
+            self.breakeven_armed = False
+
+    def next(self):
+        bar_date = self.data.datetime.date(0)
+        if self.current_day != bar_date:
+            self.current_day = bar_date
+            self.trades_today = 0
+
+        self.bars_since_loss += 1
+
+        min_bars = max(self.p.ema_trend, self.p.donchian_period, self.p.atr_avg_period) + 5
+        if len(self) < min_bars:
+            return
+
+        price = self.data.close[0]
+
+        if self.position:
+            if self.trade_type == "BUY":
+                if not self.breakeven_armed and price >= self.entry_price + self.sl_distance * self.p.breakeven_trigger:
+                    self.breakeven_armed = True
+                    self.sl = self.entry_price
+                if price >= self.tp:
+                    self.close()
+                elif self.data.low[0] <= self.sl:
+                    self.close()
+            elif self.trade_type == "SELL":
+                if not self.breakeven_armed and price <= self.entry_price - self.sl_distance * self.p.breakeven_trigger:
+                    self.breakeven_armed = True
+                    self.sl = self.entry_price
+                if price <= self.tp:
+                    self.close()
+                elif self.data.high[0] >= self.sl:
+                    self.close()
+            return
+
+        if self.trades_today >= self.p.max_trades_per_day:
+            return
+        if self.bars_since_loss < self.p.cooldown_bars:
+            return
+        if self.atr[0] < self.atr_avg[0]:
+            return
+
+        trend_bullish = price > self.ema_trend[0]
+        trend_bearish = price < self.ema_trend[0]
+        breakout_up = price > self.donchian_high[0]
+        breakout_down = price < self.donchian_low[0]
+        momentum_bullish = self.rsi[0] > 50
+        momentum_bearish = self.rsi[0] < 50
+
+        sl_distance = max(self.atr[0] * self.p.sl_atr_mult, self.p.min_sl_distance)
+
+        if trend_bullish and breakout_up and momentum_bullish:
+            self.entry_price = price
+            self.sl_distance = sl_distance
+            self.sl = price - sl_distance
+            self.tp = price + sl_distance * self.p.rr_ratio
+            self.breakeven_armed = False
+            self.trade_type = "BUY"
+            self.buy()
+            self.trades_today += 1
+        elif trend_bearish and breakout_down and momentum_bearish:
+            self.entry_price = price
+            self.sl_distance = sl_distance
+            self.sl = price + sl_distance
+            self.tp = price - sl_distance * self.p.rr_ratio
+            self.breakeven_armed = False
+            self.trade_type = "SELL"
+            self.sell()
+            self.trades_today += 1
+
+
+class SmaCrossoverExampleStrategy(bt.Strategy):
+    """Exemple pedagogique simple : croisement de deux moyennes mobiles.
+    Non optimisee, sert de point de depart pour comprendre le fonctionnement
+    de l'app."""
+    params = dict(fast=10, slow=30)
+
+    def __init__(self):
+        fast_ma = bt.ind.SMA(period=self.p.fast)
+        slow_ma = bt.ind.SMA(period=self.p.slow)
+        self.crossover = bt.ind.CrossOver(fast_ma, slow_ma)
+
+    def next(self):
+        if not self.position:
+            if self.crossover > 0:
+                self.buy()
+        elif self.crossover < 0:
+            self.close()
+
+
+STRATEGIES = {
+    "Breakout Donchian (Swing, 1h)": {
+        "class": DonchianSwingStrategy,
+        "description": (
+            "Suit la tendance (EMA200) et entre sur une cassure du plus haut/bas "
+            "des 20 dernieres bougies, filtre par la volatilite (ATR). SL/TP fixes "
+            "avec passage au breakeven. Conçue pour un timeframe **1h**."
+        ),
+        "recommended_interval": "1h",
+    },
+    "Scalping Momentum (5min)": {
+        "class": ScalpingMomentumStrategy,
+        "description": (
+            "Version plus rapide : EMA50, cassure sur 10 bougies, confirmee par le "
+            "momentum RSI, avec une pause (cooldown) apres chaque perte pour eviter "
+            "l'acharnement. Conçue pour un timeframe **5min**."
+        ),
+        "recommended_interval": "5min",
+    },
+    "Croisement de moyennes mobiles (exemple simple)": {
+        "class": SmaCrossoverExampleStrategy,
+        "description": (
+            "Stratégie pédagogique basique (SMA 10/30) pour découvrir l'app. "
+            "Non optimisée — sert de point de départ, pas de recommandation."
+        ),
+        "recommended_interval": "1h",
+    },
+}
+
+
 # ---------------------------------------------------------------------
-# Sidebar — paramètres
+# Sidebar — parametres
 # ---------------------------------------------------------------------
 st.sidebar.header("Paramètres du backtest")
 
 api_key = st.sidebar.text_input(
     "Clé API Twelve Data",
     type="password",
-    help="Gratuite sur twelvedata.com — nécessaire pour récupérer les données.",
+    help="Gratuite sur twelvedata.com — nécessaire pour récupérer les données. Ta clé n'est jamais stockée ni partagée.",
 )
 
 pair_label = st.sidebar.selectbox("Paire", list(FOREX_PAIRS.keys()))
@@ -75,19 +317,13 @@ if ticker is None:
 interval = st.sidebar.selectbox(
     "Timeframe",
     ["1day", "4h", "1h", "30min", "15min", "5min", "1min"],
+    index=2,
     help="Le tier gratuit Twelve Data limite le nombre de requêtes/jour et l'historique disponible sur les timeframes courts.",
 )
 
-# Largeur de fenêtre sûre par timeframe : reste sous la limite de 5000 bougies
-# par requête de Twelve Data, avec une marge de sécurité.
 MAX_WINDOW_DAYS = {
-    "1min": 3,
-    "5min": 15,
-    "15min": 45,
-    "30min": 90,
-    "1h": 180,
-    "4h": 600,
-    "1day": 1825,
+    "1min": 3, "5min": 15, "15min": 45, "30min": 90,
+    "1h": 180, "4h": 600, "1day": 1825,
 }
 window_days = MAX_WINDOW_DAYS[interval]
 st.sidebar.info(f"⏱️ Pour ce timeframe, période testable : **{window_days} jours** par backtest (limite Twelve Data).")
@@ -95,7 +331,7 @@ st.sidebar.info(f"⏱️ Pour ce timeframe, période testable : **{window_days} 
 offset_weeks = st.sidebar.number_input(
     "Reculer de combien de semaines par rapport à aujourd'hui ?",
     min_value=0, value=0, step=1,
-    help="0 = période la plus récente possible. Augmente pour tester une fenêtre plus ancienne (même largeur de période, juste décalée dans le temps).",
+    help="0 = période la plus récente possible. Augmente pour tester une fenêtre plus ancienne.",
 )
 
 today = dt.date.today()
@@ -114,48 +350,40 @@ commission = st.sidebar.number_input(
 )
 size_pct = st.sidebar.slider(
     "Taille de position (% du capital)", min_value=1, max_value=100, value=10,
-    help="% du capital investi à chaque trade. Une taille fixe en unités peut faire rejeter les ordres sur des actifs chers comme l'or.",
 )
 
 # ---------------------------------------------------------------------
-# Zone de code — la stratégie de l'utilisateur
+# Choix de la stratégie (plus de code libre : securite pour usage public)
 # ---------------------------------------------------------------------
 st.title("🧪 Backtester Forex")
-st.caption("Colle ta stratégie Backtrader ci-dessous, puis lance le backtest.")
+st.caption("Choisis une stratégie, configure les paramètres, puis lance le backtest.")
 
-with st.expander("ℹ️ Comment écrire ta stratégie (format attendu)"):
-    st.markdown(
-        """
-- Ta classe doit s'appeler **`MyStrategy`** et hériter de `bt.Strategy`.
-- Utilise les méthodes standard de Backtrader : `__init__`, `next`, `self.buy()`, `self.sell()`, `self.close()`.
-- `bt` (backtrader) est déjà importé, pas besoin de le réimporter.
-- Tu peux définir des paramètres via `params = dict(...)`.
-        """
-    )
-
-strategy_code = st.text_area(
-    "Code de ta stratégie",
-    value=EXAMPLE_STRATEGY,
-    height=300,
+st.warning(
+    "⚠️ **Avertissement** : ceci n'est pas un conseil financier. Les performances "
+    "passées (même backtestées) ne garantissent en rien les résultats futurs. "
+    "Ces stratégies ont été testées sur des données historiques et peuvent ne pas "
+    "fonctionner en conditions réelles (spread, slippage, changement de marché). "
+    "Utilise cet outil à des fins éducatives et teste toujours en démo avant le réel."
 )
+
+strategy_label = st.selectbox("Stratégie", list(STRATEGIES.keys()))
+strategy_info = STRATEGIES[strategy_label]
+st.info(strategy_info["description"])
+
+if interval != strategy_info["recommended_interval"]:
+    st.caption(
+        f"💡 Cette stratégie a été validée sur le timeframe "
+        f"**{strategy_info['recommended_interval']}** — tu utilises **{interval}**, "
+        f"les résultats peuvent différer de ce qui a été testé."
+    )
 
 run = st.button("🚀 Lancer le backtest", type="primary")
 
-# ---------------------------------------------------------------------
-# Exécution du backtest
-# ---------------------------------------------------------------------
-def load_strategy_class(code: str):
-    """Exécute le code collé dans un namespace isolé et récupère MyStrategy."""
-    namespace = {"bt": bt}
-    exec(code, namespace)
-    if "MyStrategy" not in namespace:
-        raise ValueError("Aucune classe 'MyStrategy' trouvée dans le code collé.")
-    return namespace["MyStrategy"]
 
-
+# ---------------------------------------------------------------------
+# Fonctions utilitaires
+# ---------------------------------------------------------------------
 def to_plain(obj):
-    """Convertit récursivement les objets internes de Backtrader (AutoOrderedDict)
-    en dict/list Python natifs, pour un affichage sûr dans Streamlit."""
     if isinstance(obj, dict):
         return {k: to_plain(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -195,12 +423,14 @@ def fetch_data(symbol: str, start: dt.date, end: dt.date, interval: str, api_key
     df = df.set_index("datetime").sort_index()
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
-    # Le forex n'a pas de vrai volume échangé centralisé ; Twelve Data n'en fournit pas non plus.
     df["volume"] = df.get("volume", 0)
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     return df[["open", "high", "low", "close", "volume"]]
 
 
+# ---------------------------------------------------------------------
+# Execution du backtest
+# ---------------------------------------------------------------------
 if run:
     try:
         with st.spinner("Récupération des données..."):
@@ -210,10 +440,9 @@ if run:
                 f"du {data.index.min():%d/%m/%Y %H:%M} au {data.index.max():%d/%m/%Y %H:%M}."
             )
 
-        with st.spinner("Chargement de la stratégie..."):
-            StrategyClass = load_strategy_class(strategy_code)
-
         with st.spinner("Backtest en cours..."):
+            StrategyClass = strategy_info["class"]
+
             cerebro = bt.Cerebro()
             cerebro.addstrategy(StrategyClass)
             feed = bt.feeds.PandasData(dataname=data, openinterest=-1)
@@ -233,9 +462,6 @@ if run:
             end_value = cerebro.broker.getvalue()
             strat = results[0]
 
-        # -----------------------------------------------------------
-        # Résultats chiffrés
-        # -----------------------------------------------------------
         st.success("Backtest terminé ✅")
 
         pnl = end_value - start_value
@@ -254,7 +480,6 @@ if run:
         trades = strat.analyzers.trades.get_analysis()
         total_trades = trades.get("total", {}).get("total", 0)
         won = trades.get("won", {}).get("total", 0)
-        lost = trades.get("lost", {}).get("total", 0)
         win_rate = (won / total_trades * 100) if total_trades else 0
 
         t1, t2, t3 = st.columns(3)
@@ -262,9 +487,6 @@ if run:
         t2.metric("Trades gagnants", won)
         t3.metric("Win rate", f"{win_rate:.1f}%")
 
-        # -----------------------------------------------------------
-        # Courbe d'équité
-        # -----------------------------------------------------------
         time_return = strat.analyzers.time_return.get_analysis()
         if time_return:
             dates = list(time_return.keys())
@@ -290,6 +512,5 @@ if run:
 
     except Exception as e:
         st.error(f"Erreur pendant le backtest : {e}")
-        st.exception(e)
 else:
-    st.info("Configure les paramètres dans la barre latérale, colle ta stratégie, puis clique sur **Lancer le backtest**.")
+    st.info("Configure les paramètres dans la barre latérale, choisis une stratégie, puis clique sur **Lancer le backtest**.")
